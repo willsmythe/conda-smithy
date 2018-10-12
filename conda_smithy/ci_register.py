@@ -2,6 +2,7 @@
 from __future__ import print_function
 import os
 import requests
+from requests.auth import HTTPBasicAuth
 import time
 import sys
 
@@ -83,6 +84,90 @@ def travis_headers():
     headers['Authorization'] = 'token {}'.format(token)
     return headers
 
+
+def add_project_to_azure_pipelines(user, project):
+    azure_devops_token = 'TODO: personal access token' # See https://docs.microsoft.com/azure/devops/organizations/accounts/use-personal-access-tokens-to-authenticate?view=vsts
+
+    headers = {'Content-Type': 'application/json',
+               'Accept': 'application/json;api-version=4.1'}
+    auth = HTTPBasicAuth('', azure_devops_token)
+
+    build_project_url = 'https://dev.azure.com/{}/feedstock-builds'.format(user)
+    pipelines_url = '{}/_apis/build/definitions'.format(build_project_url)
+
+    # Check if there is an existing pipeline for this feedstock
+    # For reference: https://docs.microsoft.com/rest/api/vsts/build/definitions/list?view=vsts-rest-4.1
+    response = requests.get('{}?name={}'.format(pipelines_url, project), auth=auth)
+    if response.status_code != 200:
+        response.raise_for_status()
+
+    if response.json()["count"] is 1:
+        print(' * {}/{} already enabled on Azure Pipelines'.format(user, project))
+    else:
+        # Look up the GitHub service connection ID (this represents the credentials needed to setup hooks in the repo, etc)
+        # For reference: https://docs.microsoft.com/rest/api/vsts/serviceendpoint/endpoints/get%20service%20endpoints?view=vsts-rest-4.1
+        service_connection_url = '{}/_apis/serviceendpoint/endpoints?type=github'.format(build_project_url)
+        response = requests.get(service_connection_url, auth=auth)
+        if response.status_code != 200:
+            response.raise_for_status()
+        service_connections = response.json()["value"]
+
+        service_connection = None
+        for x in service_connections:
+            if x["name"] == user:
+                service_connection = x
+                break
+
+        if service_connection is None:
+            raise RuntimeError("Did not find a GitHub service connection.")
+
+        repo_full_name = '{}/{}'.format(user, project)
+
+        data = {
+            'name': project,
+            'process': {
+                'type': 2,
+                'yamlFileName': 'azure-pipelines.yml'
+            },
+            'queue': {
+                'name': 'Hosted Ubuntu 1604'
+            },
+            'repository': {
+                'type': 'GitHub',
+                'url': 'https://github.com/{}.git'.format(repo_full_name),
+                'name': project,
+                'properties': {
+                    'connectedServiceId': service_connection['id'],
+                    'apiUrl': 'https://api.github.com/repos/{}'.format(repo_full_name)
+                }
+            },
+            'triggers': [
+                {
+                    'triggerType': 'continuousIntegration',
+                    'settingsSourceType': 2
+                },
+                {
+                    'triggerType': 'pullRequest',
+                    'branchFilters': [
+                        '+master'
+                    ],
+                    'forks': {
+                        'enabled': 1,
+                        'allowSecrets': 0
+                    }
+                }
+            ]
+        }
+        
+        # Create the pipeline
+        # For reference: https://docs.microsoft.com/rest/api/vsts/build/definitions/create?view=vsts-rest-4.1
+        response = requests.post(pipelines_url, headers=headers, json=data, auth=auth)
+        print(response.json())
+        if response.status_code != 201:
+            response.raise_for_status()
+        
+        print(' * {}/{} has been enabled on Azure Pipelines'.format(user, project))
+     
 
 def add_token_to_circle(user, project):
     url_template = ('https://circleci.com/api/v1.1/project/github/{user}/{project}/envvar?'
@@ -188,7 +273,7 @@ def appveyor_configure(user, project):
                   ''.format(project, required_setting, settings[required_setting]))
         settings[required_setting] = True
 
-    url = 'https://ci.appveyor.com/api/projects'.format(user, project)
+    url = 'https://ci.appveyor.com/api/projects'
     response = requests.put(url, headers=headers, json=settings)
     if response.status_code != 204:
         raise ValueError(response)
